@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+models/
+videos/
+videos_lowres/
+outputs/
