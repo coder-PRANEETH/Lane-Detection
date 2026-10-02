@@ -5,7 +5,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
 
 WEIGHTS_URL = "https://github.com/CAIC-AD/YOLOPv2/releases/download/V0.0.1/yolopv2.pt"
 
@@ -21,11 +20,27 @@ class RoadSegmenter:
 
     def __init__(self, weights="models/yolopv2.pt", device=None, input_width=640,
                  smoothing=0.0, hysteresis=0.0):
+        if not isinstance(input_width, int) or input_width < 32 or input_width % 32:
+            raise ValueError("model.input_width must be a positive multiple of 32")
+        if not 0 <= smoothing < 1 or not 0 <= hysteresis < 0.5:
+            raise ValueError("model smoothing must be in [0, 1), hysteresis in [0, 0.5)")
+        # A Pi using Hailo does not need the large, unrelated PyTorch package.
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("The torch backend requires PyTorch; install requirements.txt "
+                               "or configure backend='hailo' with a compiled HEF") from exc
+        self.torch = torch
         weights = Path(weights)
         if not weights.exists():
             weights.parent.mkdir(parents=True, exist_ok=True)
             print(f"downloading YOLOPv2 weights to {weights} ...")
-            urllib.request.urlretrieve(WEIGHTS_URL, weights)
+            partial = weights.with_suffix(weights.suffix + ".part")
+            try:
+                urllib.request.urlretrieve(WEIGHTS_URL, partial)
+                partial.replace(weights)
+            finally:
+                partial.unlink(missing_ok=True)
 
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.half = self.device.type == "cuda"
@@ -47,11 +62,16 @@ class RoadSegmenter:
         """Return a uint8 mask (1 = drivable road) with the same size as the BGR frame."""
         return self.collect(self.submit(frame))
 
-    @torch.inference_mode()
     def submit(self, frame):
         """Start segmenting a frame and return at once; the GPU keeps working in the background."""
+        validate_frame(frame)
+        with self.torch.inference_mode():
+            return self._submit(frame)
+
+    def _submit(self, frame):
+        torch = self.torch
         h, w = frame.shape[:2]
-        nh = round(h * self.input_width / w / 2) * 2
+        nh = max(2, round(h * self.input_width / w / 2) * 2)
         img = frame if (w, h) == (self.input_width, nh) else \
             cv2.resize(frame, (self.input_width, nh), interpolation=cv2.INTER_AREA)
         # The network needs sides divisible by 32: pad top and bottom like YOLOPv2's letterbox.
@@ -82,3 +102,26 @@ class RoadSegmenter:
         if mask.shape != (h, w):
             mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
         return mask
+
+    def close(self):
+        """Release temporal state; the Torch model follows normal Python ownership."""
+        self.reset()
+
+
+def validate_frame(frame):
+    if (not isinstance(frame, np.ndarray) or frame.dtype != np.uint8 or
+            frame.ndim != 3 or frame.shape[2] != 3 or min(frame.shape[:2]) < 1):
+        raise ValueError("Expected a nonempty H×W×3 uint8 BGR frame")
+
+
+def create_segmenter(config):
+    """Select the requested inference backend without falling back to another device."""
+    backend = config.get("backend", "torch")
+    common = {key: config[key] for key in ("smoothing", "hysteresis") if key in config}
+    if backend == "torch":
+        options = {key: config[key] for key in ("weights", "device", "input_width") if key in config}
+        return RoadSegmenter(**options, **common)
+    if backend == "hailo":
+        from .hailo_segmenter import HailoSegmenter
+        return HailoSegmenter(**config.get("hailo", {}), **common)
+    raise ValueError(f"Unknown model backend {backend!r}; choose 'torch' or 'hailo'")

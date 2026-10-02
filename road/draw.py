@@ -13,7 +13,7 @@ ORANGE = (0, 160, 255)
 WAY_COLORS = {"straight": (255, 120, 0), "left": (0, 140, 255), "right": (200, 60, 200)}
 
 
-def draw(frame, res, fps=None):
+def draw(frame, res, fps=None, control=None):
     out = frame.copy()
     h, w = out.shape[:2]
     if res.mask is not None:
@@ -47,7 +47,7 @@ def draw(frame, res, fps=None):
     if not res.found:
         lines.append(("NO ROAD", RED))
     else:
-        lines.append((f"steer {res.steer_deg:+5.1f} deg", WHITE))
+        lines.append((f"lane target {res.steer_deg:+5.1f} deg", WHITE))
         lines.append((f"offset {res.offset:+.2f} lane", WHITE))
         if res.ways:
             names = [way.name for way in res.ways]
@@ -57,6 +57,13 @@ def draw(frame, res, fps=None):
             lines.append(("road lost - holding last lane", ORANGE))
         if res.obstacle is not None:
             lines.append(("OBSTACLE IN LANE", RED))
+    if control is not None:
+        if control.holding_straight:
+            lines.append(("keeping straight", WHITE))
+        if control.measured_angle_deg is not None:
+            lines.append((f"angle {control.measured_angle_deg:5.1f} -> {control.target_angle_deg:5.1f} deg", WHITE))
+            lines.append((f"correction {control.error_deg:+5.1f} deg", WHITE))
+        lines.append((f"motor: {control.status}", WHITE if control.enabled else ORANGE))
     if fps:
         lines.append((f"{fps:.0f} fps", WHITE))
     hud(out, lines)

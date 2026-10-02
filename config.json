@@ -1,0 +1,76 @@
+{
+  "source": {
+    "mode": "video",
+    "path": "videos_lowres/road_video.mp4",
+    "device": 0,
+    "width": 640,
+    "height": 360,
+    "fps": 30.0,
+    "read_timeout": 2.0
+  },
+  "model": {
+    "backend": "torch",
+    "weights": "models/yolopv2.pt",
+    "device": null,
+    "input_width": 640,
+    "smoothing": 0.0,
+    "hysteresis": 0.0,
+    "hailo": {
+      "hef": "models/road_segmentation.hef",
+      "input_name": null,
+      "output_name": null,
+      "output_layout": "HWC",
+      "output_kind": "logits",
+      "road_class": 1
+    }
+  },
+  "lane": {
+    "lookahead": 0.4,
+    "horizon": null,
+    "hfov": 70.0,
+    "average": 5,
+    "hold_frames": 15,
+    "row_step": 4,
+    "prefer": "straight",
+    "stabilize": true,
+    "smoothing_tau": 0.25,
+    "max_offset_rate": 0.35,
+    "max_steer_rate": 20.0,
+    "max_dt": 0.1
+  },
+  "steering": {
+    "mode": "simulation",
+    "enabled": false,
+    "calibrated": false,
+    "center_deg": 0.0,
+    "sensor_direction": 1,
+    "steering_gain": 1.0,
+    "max_steer_deg": 30.0,
+    "max_rate_deg_s": 45.0,
+    "max_accel_deg_s2": 120.0,
+    "deadband_deg": 0.5,
+    "kp": 0.04,
+    "max_command": 0.35,
+    "max_frame_age_s": 0.3,
+    "max_sensor_age_s": 0.15,
+    "max_update_gap_s": 0.5,
+    "command_timeout_s": 0.2,
+    "simulated_speed_deg_s": 90.0,
+    "serial_port": "/dev/ttyACM0",
+    "baudrate": 115200,
+    "serial_timeout_s": 0.03,
+    "keep_straight": true,
+    "straight_angle_tolerance_deg": 1.0,
+    "straight_heading_tolerance_deg": 3.0,
+    "straight_edge_margin": 0.15,
+    "straight_hysteresis": 0.03
+  },
+  "output": {
+    "directory": "outputs",
+    "save_video": true,
+    "csv": true,
+    "show": false,
+    "max_frames": 0,
+    "progress_every": 300
+  }
+}

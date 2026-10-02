@@ -1,3 +1,3 @@
 from .draw import draw
 from .lane import LaneEstimator, LaneResult
-from .segmenter import RoadSegmenter
+from .segmenter import RoadSegmenter, create_segmenter

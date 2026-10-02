@@ -1,0 +1,2 @@
+# Optional: only needed for the serial angle-sensor / motor bridge.
+pyserial>=3.5,<4

@@ -1,197 +1,144 @@
-# Lane detection for unmarked roads
+# Lane detection and steering feedback
 
-Finds the drivable lane and a steering direction on roads with **no lane markings**, such as campus roads with curbs, tree shadows and patched concrete. Everything uses a pretrained model, so nothing needs to be trained.
+Detects the drivable road on unmarked roads, estimates a lane, smooths the offset and target direction, reads a 0–360° steering encoder, and computes the motor correction. The same pipeline accepts recordings, a USB camera, or a Raspberry Pi camera.
 
-The whole road is treated as one lane: a straight rectangle on the ground, fitted to the road the model sees and kept stable over time. Where the road splits (a side road, a T-junction or a crossroad), every way to go gets its own rectangle, and the vehicle follows the one you prefer.
+The default runs the existing YOLOPv2 model and a **simulated encoder/motor**, so it is checkable on a laptop. Physical steering uses a configurable serial bridge. Raspberry Pi capture and Hailo inference adapters are included; real hardware needs its calibrated sensor/driver and a compatible compiled HEF model. See [hardware integration](docs/hardware.md) and [Pi setup](docs/pi.md).
 
-![Example output: plain road, a side road on the left, and a T-junction](docs/example.jpg)
+![Road geometry examples](docs/example.jpg)
 
-*Left to right: plain road; a side road on the left (following straight); a T-junction (the road ends, so the vehicle turns left).*
+## Run on a laptop
 
-## Quick start
+Python 3.10 or newer:
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -r requirements.txt   # for a GPU, install a CUDA build of PyTorch (pytorch.org)
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python run.py --config config.json
 
-.venv/bin/python run.py videos_lowres/road_video.mp4 --csv   # writes outputs/road_video_lane.mp4 + _steering.csv
-.venv/bin/python run.py videos_lowres                        # every video in a folder
-.venv/bin/python run.py 0 --show                             # live from camera 0, press q to quit
+# Override the source without editing the config:
+.venv/bin/python run.py videos_lowres/near_hostel.mp4
+.venv/bin/python run.py videos_lowres             # every video in the folder
+.venv/bin/python run.py 0 --show                   # USB camera, simulated steering
+.venv/bin/python run.py videos_lowres/road_video.mp4 --device cpu --max-frames 30 --no-save
 ```
 
-The YOLOPv2 weights (`models/yolopv2.pt`) are downloaded on the first run.
+CUDA is selected when available; CPU is supported. Weights are downloaded to `models/yolopv2.pt` if absent. `--show` opens a preview; Q/Escape exits. Ctrl-C/SIGTERM, failures and normal completion close the controller and disable its motor output.
 
-`compress_videos.py` turns the original videos in `videos/` into 640×360, 30 fps copies in `videos_lowres/`, so the tests match a low-quality camera. It needs `ffmpeg`.
+Each source writes `outputs/<name>_lane.mp4`, `<name>_steering.csv` and `<name>_summary.json`. The CSV records raw and filtered signals, current and target encoder angles, correction, motor effort, and reasons for disabling control. Video mode processes every frame at the recording's timestamps regardless of inference speed. Live mode drops queued frames and uses elapsed time.
 
-## Architecture
+## Configuration
 
-Each frame goes through three stages:
-1. A pretrained network marks which pixels are road.
-2. Plain geometry turns that road area into one lane and a steering target.
-3. A junction step checks whether the road splits ahead.
+Edit [config.json](config.json); run with `python run.py --config config.json`. Relative paths resolve against the configuration file's directory. Unknown keys and invalid values fail with an error.
+
+| Setting | Meaning |
+| --- | --- |
+| `source.mode` | `video`, `camera` (OpenCV/USB/V4L2), or `picamera2` (Pi CSI camera) |
+| `source.path` | Recording or folder, used in video mode |
+| `source.device` | Camera index, or a device path such as `/dev/video0` for OpenCV |
+| `source.width`, `height`, `fps` | Requested live capture size/rate; default 640×360 at 30 fps |
+| `model.backend` | `torch` for the supplied model; `hailo` for a separate compatible HEF |
+| `model.device` | `null` for auto, `cpu`, or `cuda` for PyTorch |
+| `lane.smoothing_tau` | Final low-pass time constant, default 0.25 seconds |
+| `lane.max_offset_rate` | Maximum offset change, default 0.35 lane widths/second |
+| `lane.max_steer_rate` | Maximum target-direction change, default 20 degrees/second |
+| `lane.max_dt` | Maximum elapsed time consumed by smoothing after a stall, default 0.1 s |
+| `lane.hfov` | Camera horizontal field of view, default 70°; set to your camera's measured FOV |
+| `lane.lookahead` | Target row between horizon (0) and image bottom (1), default 0.4 |
+| `lane.horizon` | Fixed horizon fraction, or `null` to estimate it |
+| `lane.prefer` | Junction preference: `straight`, `left`, or `right` |
+| `steering.mode` | `simulation`, `serial`, or `disabled` |
+| `steering.center_deg` | Encoder reading when steering is straight |
+| `steering.sensor_direction` | +1 if encoder increases when steering right, otherwise -1 |
+| `steering.steering_gain` | Measured actuator-degrees per degree of visual target bearing |
+| `steering.max_steer_deg` | Allowed encoder travel either side of center, default ±30° |
+| `steering.max_rate_deg_s`, `max_accel_deg_s2` | Actuator target velocity/acceleration limits |
+| `steering.kp`, `deadband_deg`, `max_command` | Proportional effort gain, angle deadband, normalized effort limit |
+| `steering.keep_straight` | Keep a straight course inside the road instead of always seeking its center; default `true` |
+| `steering.straight_angle_tolerance_deg` | How close measured steering must be to calibrated straight ahead; default 1° |
+| `steering.straight_heading_tolerance_deg` | Maximum road direction difference from the vehicle for keeping straight; default 3° |
+| `steering.straight_edge_margin` | Required clearance from either edge, in lane widths, along the visible forward path; default 0.15 |
+| `steering.straight_hysteresis` | Clearance allowance while already keeping straight, to avoid toggling; default 0.03 lane widths |
+| `output.save_video`, `csv`, `show` | Annotated recording, telemetry and preview switches |
+| `output.max_frames` | 0 processes the entire recording / runs the camera continuously |
+
+Lower the smoothing rates or increase the time constant for gentler motion. This increases tracking lag, so tune against the vehicle's speed and steering response. Rates use seconds, not frame counts. The fit median and junction confirmation still use frame windows.
+
+To switch to a live camera, change `source.mode` to `camera` or `picamera2`, set `source.device`, and keep `steering.mode="simulation"` while checking the image and calibration. `output.show=false` works over SSH without a desktop. Disable recording for lower I/O overhead.
+
+The earlier CLI options (`--lookahead`, `--horizon`, `--hfov`, `--prefer`, `--average`, `--out`, `--show`, `--no-save`, `--csv`, `--weights`, `--device`, `--no-stabilize`) remain available. `--no-stabilize` is for comparisons and is rejected with enabled physical steering.
+
+## Smoothing and feedback
 
 ```mermaid
-flowchart TD
-    F["Video frame or camera image<br/>(BGR, e.g. 640×360)"] --> S
-
-    subgraph SEG ["road/segmenter.py · RoadSegmenter"]
-        S["YOLOPv2, pretrained on BDD100K<br/>drivable-area output → road mask"]
-    end
-
-    subgraph LANE ["road/lane.py · LaneEstimator"]
-        C["clean_mask<br/>fill gaps, keep the road region in front of the vehicle"]
-        E["row_extents<br/>left and right road edge on every 4th row"]
-        HW["horizon_row + measure_width<br/>median over the last 150 frames"]
-        FIT["fit_road<br/>straight strip of constant width on flat ground (RANSAC)"]
-        GATE["_remember<br/>drop one-off outliers, take the median of the last 5 fits"]
-        EURO["1€ filter on the lane"]
-        GEO["lane edges, centre line,<br/>lookahead target, steering angle"]
-        C --> E --> HW --> FIT --> GATE --> EURO --> GEO
-    end
-
-    subgraph JUNC ["road/junction.py"]
-        FJ["find_junction<br/>side-road mouths, road end<br/>(after a 30-frame warm-up)"]
-        TR["JunctionTracker<br/>shown once seen in 4 of the last 7 frames"]
-        BW["build_ways<br/>one rectangle per way to go"]
-        FJ --> TR --> BW
-    end
-
-    S --> C
-    GEO --> FJ
-    BW --> PICK["follow the --prefer way<br/>(straight / left / right)"]
-    GEO -->|no junction| T
-    PICK --> T["1€ filter on the steering target"]
-    T --> OB["nearest_obstacle<br/>something that isn't road blocking the lane"]
-    OB --> R(["LaneResult"])
-    R --> D["road/draw.py → *_lane.mp4"]
-    R --> CSV["run.py → *_steering.csv"]
-    BW -.->|"road ends here: the next frame fits<br/>only the road before the junction"| FIT
+flowchart LR
+    A[Video / latest camera frame] --> B[PyTorch or Hailo road segmentation]
+    B --> C[Road fit and junction selection]
+    C --> D[Outlier confirmation and adaptive filters]
+    D --> E[Low-pass and hard rate limits]
+    E --> F[Calibrated actuator target]
+    G[Fresh 0–360 degree encoder] --> H[Target minus measured angle]
+    F --> H
+    H --> I[Bounded motor effort / simulated motor]
+    I --> G
 ```
 
-### 1. Road segmentation (`road/segmenter.py`)
+The road is fitted as a constant-width strip on approximately flat ground. Near a junction, the selected branch supplies the lookahead target. `offset` is the road center's lateral displacement in **lane widths**, positive to the right; it is not an angle or a distance in meters. To display it as percent, multiply by 100. `steer_deg` is the target's camera bearing, positive right.
 
-[YOLOPv2](https://github.com/CAIC-AD/YOLOPv2) is a driving-perception network trained on BDD100K. Only its **drivable-area** output is used; it outputs road even where there are no markings. The frame is resized to 640 px wide and padded to a multiple of 32. On a GPU the model runs in half precision, and pixels with a road probability above 0.5 form the road mask.
+The earlier adaptive filter increased its responsiveness during large changes, so it could still pass abrupt jumps. The final output now uses `alpha = 1 - exp(-dt / tau)` and clamps each change to `max_rate * dt`. At 30 fps, the default offset can change by at most **0.01167 lane widths (1.167 percentage points)** per frame, and the visual steering target by **0.667°** per frame. These bounds apply from neutral startup and after reacquisition. `raw_offset` and `raw_steer_deg` mean upstream of this final filter, after the existing geometry/adaptive filters.
 
-`run.py` gives the GPU the next frame before it does the CPU work on the current one. This gives about 50 fps on an RTX 3050 laptop GPU at 640×360, when plugged in: laptop GPUs run far slower on battery.
+Outlier replacement now requires consecutive fits that agree with one another. A missing or rejected fit freezes the last displayed output and marks it held; it cannot continue moving the motor. After the hold window the lane is marked lost. Logged filtered values retain their last value to avoid a false jump to zero. `found=true, held=true` means display continuity, not a fresh observation.
 
-### 2. From road mask to lane (`road/lane.py`)
+Feedback uses:
 
-**Clean-up and edges.** Small gaps and specks are removed from the mask, and only the road region right in front of the vehicle is kept. On every 4th image row, the leftmost and rightmost road pixels are the road edges. An edge that touches the image border is marked as not really seen.
-
-**Flat-ground model.** The ground is assumed flat and the camera to point forward. On flat ground, a road of constant width looks narrower in proportion to its distance, so fitting road width against image row finds the **horizon** row `y_h`, where the width would shrink to zero. With the horizon known, every road pixel `(x, y)` maps to ground coordinates, with no camera calibration needed:
-
-```
-    z = h / (y − y_h)             distance ahead (relative; h = image height)
-    X = (x − c_x) / (y − y_h)     sideways position (c_x = image centre column), same units at every distance
-
-         camera image                          ground, seen from above
-  ------------------------- horizon y_h
-              /    \                               |    :    |
-             /      \                              |    o    |  <- lookahead target
-            /    o   \                             |    :    |
-           /     :    \          ------->          |    :    |     road width W,
-          /      :     \                           |    :    |     the same everywhere
-         /_______:______\                          |____:____|
-                 ^ camera                               ^ vehicle
+```text
+requested_steer = clamp(steering_gain * steer_deg, -max_steer_deg, +max_steer_deg)
+limited_steer   = velocity/acceleration-limited requested_steer
+absolute_target = (center_deg + sensor_direction * limited_steer) % 360
+correction      = (absolute_target - measured_angle + 180) % 360 - 180
+motor_effort    = clamp(kp * correction, -max_command, +max_command)
 ```
 
-**Fitting the lane.** The road is fitted as a **straight strip of constant width** on the ground: a rectangle that looks like a trapezoid in the image. Its centre line is `X = heading · z + offset`. Each visible edge point gives an estimate of the centre (edge ± W/2), and RANSAC fits the line that most of them agree on. Errors are measured in pixels, so a ragged far edge counts no more than a clean near one. A strip stays stable when one edge is off-screen or the mask is ragged. Curves are approximated by a straight strip that is refitted every frame.
+For example, current 350° and target 10° gives +20°, not −340°. Inside the angle deadband, effort is zero. The encoder represents a single revolution: a multi-turn steering shaft needs an unwrapped/multi-turn sensor and a different adapter.
 
-The horizon and the road width barely change, so both are the **median over the last 150 frames** (about 5 s). The width is never less than the road visible on the nearer rows, so the lane always covers the road.
+The visual bearing is not a calibrated vehicle steering angle. Set the gain, center, direction, mechanical travel and motor polarity using your linkage. This implementation provides a proportional position loop; it does not model speed, wheelbase or tire dynamics.
 
-**Steering.** The target is the point on the centre line at `--lookahead` (default 0.4 of the way from the horizon to the bottom of the frame). The steering angle is the direction of that point from straight ahead, based on the camera's horizontal field of view (`--hfov`). `offset` is how far the lane centre is from the vehicle, in lane widths.
+### Continuing straight while off center
 
-### 3. Keeping it stable
+With `steering.keep_straight=true`, being off center alone does not demand a turn. If measured steering is near calibrated zero, the vehicle is aligned with the fitted road, and the straight forward path has enough clearance from both edges throughout the visible fit, the requested actuator angle stays **0° relative to straight ahead**. For example, an offset of 0.25 lane widths on a parallel road can continue straight with no centering effort. Road heading is calculated separately from the bearing toward the lane center, which can be nonzero simply because the vehicle is off center.
 
-The road doesn't change much from one frame to the next, so the lane shouldn't either. Several layers make sure of this:
+The default requires 15% of a lane width of clearance to enter this mode and 12% to remain in it. Increase `straight_edge_margin` to reserve more room for the vehicle's width and tracking error; it is an image-derived road-width fraction, not a calibrated vehicle footprint. When clearance shrinks, the road direction changes, the wheels are already turned, or a left/right junction branch is selected, normal steering resumes. Lost/held lanes, obstacles and sensor faults still disable motor effort. Existing target rate/acceleration limits also apply when entering or leaving this mode.
 
-| Layer | What it stops |
-|---|---|
-| Long-term medians of horizon and road width (150 frames) | the lane growing or shrinking every frame |
-| Outlier gate: a fit more than 0.25 lane widths away from the recent road is skipped, unless that keeps happening for 5 frames in a row (then the road really changed) | one-off bad masks (a shadow or a bright patch) |
-| Median of the last 5 fits | jitter; a stray fit can't drag the median |
-| [1€ filter](https://gery.casiez.net/1euro/) on the lane values and the steering target | leftover jitter, without lag when the road really turns: it smooths hard when steady and lightly when moving |
-| Junction tracker: shown after 4 of 7 frames, hidden after at most 2 of 7, with looser thresholds for a way already shown | junctions blinking on and off |
-| Hold the last lane for up to 15 frames if the road is lost | flicker when the model misses a frame |
+The overlay says **keeping straight** when this policy is active. `holding_straight`, `heading_deg` and `straight_clearance` are recorded in the CSV. `steer_deg`/the overlay's **lane target** still describe the lane-center target; `desired_steer_deg` and `target_steer_deg` describe the actual actuator request. Set `keep_straight=false` to restore continuous centering.
 
-`--no-stabilize` turns off the 1€ filters, for comparison.
+## Motor integration and failure behavior
 
-### 4. Junctions (`road/junction.py`)
+The serial adapter expects a small controller to read your encoder and drive your motor using the [documented JSON protocol](docs/hardware.md). It is not a generic driver for arbitrary angle-sensor modules. No GPIO pin assignments or device-specific sensor registers are assumed.
 
-Junctions are found **row by row in the image**, not in a top-down view. Within one image row, sideways distances on the ground are in proportion to pixels, so each row compares how far the road reaches sideways with the lane's width at that row:
+Physical output requires a live source, `steering.mode="serial"`, `enabled=true` and `calibrated=true`. Defaults keep hardware unopened. Recorded video always stays virtual during the regression suite.
 
-```
- going up the lane, row by row   (# road   . not road   [ ] the lane)
+A held/lost lane, indicated obstacle, stale camera frame, invalid/stale angle, out-of-range angle, update stall or serial failure disables effort. Fresh sensor requests use sequence numbers, so old serial replies are not accepted as new samples. Commands expire after `command_timeout_s`; the bridge firmware must enforce that timeout independently of Python. **Disabling steering effort does not brake the vehicle**; propulsion/braking and emergency stop are outside this repository.
 
- ....[..........]....   road ends: the middle of the lane is not road,
- ....[..........]....   and there is no road beyond it
- ####[##########]####   side-road mouths: the road reaches well past the lane edge,
- ####[##########]####   further than it usually does along this road
- ..##[##########]##..   ordinary road
- ..##[##########]##..
+## Tests
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python scripts/test_videos.py
 ```
 
-- **Side road:** a band of rows where the road reaches at least 0.5 lane widths past the lane edge, beyond the road's usual overhang. The band must also be deep enough on the ground to be a road.
-- **Road end:** the middle of the lane stops being road with no road beyond it, or the road visibly stops short, or it doesn't carry on towards the horizon. A patch the model missed, like a speed breaker, has road again past it, so it doesn't count.
-- **Ways:** side roads are assumed to leave at right angles, and each one is drawn 1.5 lane widths out. *Straight* is offered only when the road doesn't end. The vehicle follows the `--prefer` way (default `straight`). If that way isn't there, it falls back to straight, then left, then right.
-- When the road ends at the junction, the next frame's lane is fitted only to the road before it, so the crossing road doesn't bend it.
-- Junction detection starts after 30 frames, once the road width estimate has settled.
+The regression command runs **every frame** of `near_hostel.mp4`, `nmv_road.mp4`, `perfect_roada.mp4` and `road_video.mp4`, writes annotated videos/CSVs under `outputs/regression/`, checks decoded frame counts, finite outputs, rate limits, circular errors, motor bounds and fault disablement, and produces `report.json`. Use `--no-save` to skip only annotated video output. [Recorded results](docs/test_results.md) describe the completed run and its limits.
 
-## Output
+Tests also cover spikes, persistent changes, dropped lanes, variable timing, wraparound, sensor faults, serial sequences, resource cleanup, camera buffering and mocked Hailo tensors. These validate software behavior; there is no ground-truth lane annotation or physical Pi/motor test in this workspace.
 
-The annotated video, `outputs/<name>_lane.mp4`:
+## Files and limitations
 
-| On screen | Meaning |
-|---|---|
-| green tint | road seen by the model |
-| blue tint, yellow edges | the lane (the whole road as one rectangle) |
-| magenta line and dot | path being followed and its steering target |
-| white line | steering direction from the camera |
-| grey horizontal line | estimated horizon |
-| blue / orange / purple areas | straight / left / right ways at a junction; bold outline = the one followed |
-| red line | nearest obstacle in the lane |
+| File | Responsibility |
+| --- | --- |
+| `run.py`, `road/config.py` | Configuration, pipeline, outputs and resource cleanup |
+| `road/capture.py` | Recorded/OpenCV/Picamera2 capture; bounded live frame buffer |
+| `road/segmenter.py`, `road/hailo_segmenter.py` | TorchScript and optional Hailo inference |
+| `road/lane.py`, `road/junction.py`, `road/filters.py` | Geometry, junctions, outliers and smoothing |
+| `road/control.py` | Encoder feedback, simulated/serial motor and faults |
+| `road/draw.py` | Lane and steering feedback overlay |
+| `scripts/test_videos.py`, `tests/` | Full recordings and hardware-independent tests |
 
-The top-left panel shows the steering angle (+ = right), the lane offset, the junction and the way being followed, obstacle and road-lost warnings, and fps.
-
-`outputs/<name>_steering.csv` (written with `--csv`) has one row per frame: `frame, found, steer_deg, offset, obstacle_row, ways, following`.
-
-## Options
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--prefer` | `straight` | way to take where the road splits: `straight`, `left` or `right` |
-| `--lookahead` | 0.4 | steering target row: 0 = horizon, 1 = bottom of the frame |
-| `--hfov` | 70 | camera horizontal field of view in degrees, used for the steering angle |
-| `--horizon` | estimated | fixed horizon row as a fraction of image height, for a fixed camera |
-| `--average` | 5 | the lane is the median of the last N fits |
-| `--no-stabilize` | off | turn off the 1€ smoothing |
-| `--out` | `outputs/` | output folder |
-| `--show` / `--no-save` / `--csv` | | live window / don't write the video / write the steering CSV |
-| `--weights`, `--device` | `models/yolopv2.pt`, auto | model file; `cuda` or `cpu` |
-
-## Code layout
-
-| File | What it does |
-|---|---|
-| `run.py` | command line: reads a video, folder or camera, runs everything, writes the video and CSV |
-| `road/segmenter.py` | `RoadSegmenter`: YOLOPv2 drivable-area mask (`submit`/`collect` for overlapping GPU work) |
-| `road/lane.py` | `LaneEstimator`: mask → horizon, width, lane fit, smoothing, steering, obstacles |
-| `road/junction.py` | junction detection, `JunctionTracker`, the rectangles for each way |
-| `road/filters.py` | `OneEuroFilter` |
-| `road/draw.py` | the overlay and the top-left panel |
-| `compress_videos.py` | downscales test videos to match the target camera |
-
-## Why this approach
-
-- The roads have no markings, so lane-line models (UFLD and similar) have nothing to detect. Drivable-area segmentation finds road surface instead.
-- Only pretrained weights are used, since training wasn't an option.
-- Plain edge detection (Canny) breaks down under heavy tree shadows. Curved lane fits in image coordinates were unstable. A constant-width strip on flat ground, fitted with RANSAC, holds up much better.
-- A top-down (bird's-eye) view was tried for junctions and dropped: with a low camera, errors in the horizon estimate distort it too much. Comparing within image rows avoids that.
-
-## Known limitations
-
-- It assumes flat ground and a forward-facing camera near the vehicle's centre line. Steep slopes throw off the horizon estimate.
-- The model marks a vehicle right ahead as not-road, so the road can look like it ends there and a false turn appears.
-- At very wide, open crossroads the straight way can be missed, and only left/right is offered.
-- Sun-bleached concrete patches are sometimes marked not-road, which can raise false obstacle warnings.
-- Open areas that aren't roads (parking lots, yards) produce unreliable lanes.
+The model is trained on BDD100K and treats the entire detected road as one lane. It assumes a forward-facing camera near the vehicle center and approximately flat ground. Slopes, wide open areas, sharp curves, shadows and washed-out concrete can invalidate the fit. Junction choices and obstacle indications are heuristics; false detections can disable steering. The smoothing bounds do not establish road-following accuracy. Hailo model compilation, camera/sensor calibration, real motor tuning, and device-specific bridge firmware remain deployment requirements.
